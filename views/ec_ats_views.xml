@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <!-- Mantener ATS visible directamente en Contabilidad > Reportes.
+         El menú raíz Ecuador — SRI se conserva para otros reportes (ej. IVA 104). -->
+
+    <menuitem id="menu_ec_sri_ats_root"
+              name="Ecuador — SRI"
+              parent="account.menu_finance_reports"
+              sequence="99"/>
+
+    <menuitem id="menu_ec_ats"
+              name="ATS — Anexo Transaccional"
+              parent="menu_ec_sri_ats_root"
+              action="l10n_ec_ats.action_ec_ats_report_run"
+              sequence="10"/>
+
+    
+</odoo>
