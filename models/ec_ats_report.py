@@ -195,7 +195,7 @@ class EcAtsReport(models.AbstractModel):
             registro = {
                 # Identificación proveedor
                 'codSustento': self._get_cod_sustento(move),
-                'tpIdProv': self._get_tipo_id(proveedor),
+                'tpIdProv': self._get_tipo_id(proveedor, section='purchase'),
                 'idProv': proveedor.vat or '',
                 'tipoComprobante': self._get_tipo_comprobante(move),
                 'parteRel': 'SI' if self._es_parte_relacionada(proveedor) else 'NO',
@@ -314,7 +314,7 @@ class EcAtsReport(models.AbstractModel):
         for move in moves:
             cliente = move.partner_id
             lineas = self._get_tax_lines(move)
-            tipo_id = self._get_tipo_id(cliente)
+            tipo_id = self._get_tipo_id(cliente, section='sale')
             tipo_comp = self._get_tipo_comprobante(move)
             es_electronica = bool(self._get_autorizacion(move))
             tipo_emision = 'E' if es_electronica else 'F'
@@ -407,7 +407,7 @@ class EcAtsReport(models.AbstractModel):
         result = []
         for move in moves:
             result.append({
-                'tpIdClienteEx': '20',
+                'tpIdClienteEx': self._get_tipo_id(move.partner_id, section='export') or '20',
                 'idClienteEx': move.partner_id.vat or '',
                 'parteRelExp': 'SI' if self._es_parte_relacionada(move.partner_id) else 'NO',
                 'exportacionDe': '01',
@@ -907,18 +907,39 @@ class EcAtsReport(models.AbstractModel):
                             result['ir'] += abs(line.balance)
         return result
 
-    def _get_tipo_id(self, partner):
-        """Determina el código de tipo de identificación del partner (Tabla 1)."""
+    def _get_tipo_id(self, partner, section='sale'):
+        """
+        Determina el código ATS de tipo de identificación.
+        Usa el mapeo parametrizable (l10n_ec_ats_idtype) y conserva fallback compatible.
+        """
+        section = (section or 'sale').strip().lower()
         if not partner:
-            return '07'  # Consumidor final
+            return '07' if section == 'sale' else ('21' if section == 'export' else '03')
+
+        if hasattr(partner, '_l10n_ec_get_ats_id_code'):
+            mapped_code = partner._l10n_ec_get_ats_id_code(section=section)
+            if mapped_code:
+                return mapped_code
+
+        # Fallback defensivo en caso de no tener el modulo de mapeo.
         vat = partner.vat or ''
+        if section == 'purchase':
+            if len(vat) == 13:
+                return '01'
+            if len(vat) == 10:
+                return '02'
+            return '03'
+        if section == 'export':
+            if len(vat) == 13:
+                return '20'
+            return '21'
         if len(vat) == 13:
-            return '04'  # RUC
-        elif len(vat) == 10:
-            return '05'  # Cédula
-        elif partner.country_id and partner.country_id.code != 'EC':
-            return '08'  # Identificación del exterior
-        return '06'  # Pasaporte por defecto
+            return '04'
+        if len(vat) == 10:
+            return '05'
+        if partner.country_id and partner.country_id.code != 'EC':
+            return '06'
+        return '06'
 
     def _get_tipo_comprobante(self, move):
         """Determina el código de tipo de comprobante (Tabla 2)."""
@@ -951,23 +972,41 @@ class EcAtsReport(models.AbstractModel):
         return '01'
 
     def _get_establecimiento(self, ref):
-        """Extrae el número de establecimiento de una referencia como '001-001-000000001'."""
-        if not ref:
-            return '001'
-        parts = str(ref).split('-')
-        return parts[0].zfill(3) if parts else '001'
+        """Extrae establecimiento desde el número de comprobante con fallback seguro."""
+        estab, _pto, _sec = self._extract_comprobante_parts(ref)
+        return estab
 
     def _get_punto_emision(self, ref):
-        if not ref:
-            return '001'
-        parts = str(ref).split('-')
-        return parts[1].zfill(3) if len(parts) > 1 else '001'
+        _estab, pto, _sec = self._extract_comprobante_parts(ref)
+        return pto
 
     def _get_secuencial(self, ref):
-        if not ref:
-            return '000000001'
-        parts = str(ref).split('-')
-        return parts[2].zfill(9) if len(parts) > 2 else '000000001'
+        _estab, _pto, sec = self._extract_comprobante_parts(ref)
+        return sec
+
+    def _extract_comprobante_parts(self, ref):
+        """
+        Extrae (estab, pto_emi, secuencial) buscando un patrón numérico robusto.
+        Acepta separadores no estándar y evita propagar prefijos alfanuméricos.
+        """
+        text = str(ref or '').strip()
+        if not text:
+            return '001', '001', '000000001'
+
+        match = re.search(r'(\d{3})\D+(\d{3})\D+(\d{1,9})(?!\d)', text)
+        if match:
+            estab, pto, sec = match.groups()
+            return estab.zfill(3), pto.zfill(3), sec.zfill(9)
+
+        # Fallback: usar grupos de dígitos en orden (si existen).
+        groups = re.findall(r'\d+', text)
+        if len(groups) >= 3:
+            estab = groups[0][-3:].zfill(3)
+            pto = groups[1][-3:].zfill(3)
+            sec = groups[2][-9:].zfill(9)
+            return estab, pto, sec
+
+        return '001', '001', '000000001'
 
     def _get_autorizacion(self, move):
         """Obtiene el número de autorización del comprobante."""

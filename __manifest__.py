@@ -30,6 +30,7 @@
     'depends': [
         'account',   # Community
         'l10n_ec',   # Localización oficial Ecuador (Community desde v16)
+        'l10n_ec_ats_idtype',
     ],
     'data': [
         'security/ir.model.access.csv',
