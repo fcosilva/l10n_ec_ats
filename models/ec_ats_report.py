@@ -92,6 +92,7 @@ from collections import defaultdict
 from datetime import datetime
 import io
 import logging
+import re
 
 _logger = logging.getLogger(__name__)
 
@@ -135,6 +136,7 @@ class EcAtsReport(models.AbstractModel):
         ventas = self._get_ventas(company, date_from, date_to, options)
         exportaciones = self._get_exportaciones(company, date_from, date_to)
         anulados = self._get_anulados(company, date_from, date_to)
+        ventas_establecimiento = self._get_ventas_establecimiento(ventas)
 
         # Calcular totales
         totales = self._calcular_totales(compras, ventas)
@@ -142,13 +144,14 @@ class EcAtsReport(models.AbstractModel):
         # Generar XML
         xml_bytes = self._build_xml(
             company, date_from, date_to, options,
-            compras, ventas, exportaciones, anulados, totales
+            compras, ventas, ventas_establecimiento, exportaciones, anulados, totales
         )
 
         return {
             'xml': xml_bytes,
             'compras': compras,
             'ventas': ventas,
+            'ventas_establecimiento': ventas_establecimiento,
             'exportaciones': exportaciones,
             'anulados': anulados,
             'totales': totales,
@@ -217,8 +220,9 @@ class EcAtsReport(models.AbstractModel):
                 'valRetBien10': retenciones.get('ret_iva_bienes_10', 0.0),
                 'valRetServ20': retenciones.get('ret_iva_serv_20', 0.0),
                 'valorRetBienes': retenciones.get('ret_iva_bienes', 0.0),
+                'valRetServ50': retenciones.get('ret_iva_serv_50', 0.0),
                 'valorRetServicios': retenciones.get('ret_iva_serv', 0.0),
-                'valorRetServSinCostoBenef': retenciones.get('ret_iva_sinCosto', 0.0),
+                'valRetServ100': retenciones.get('ret_iva_sinCosto', 0.0),
 
                 # Retenciones IR (detalleAir)
                 'detalleAir': retenciones.get('detalleAir', []),
@@ -336,7 +340,8 @@ class EcAtsReport(models.AbstractModel):
                 'montoIce': lineas.get('ice', 0.0),
                 'valorRetIva': ret_recibidas.get('iva', 0.0),
                 'valorRetRenta': ret_recibidas.get('ir', 0.0),
-                'formaPago': self._get_forma_pago_cobro(move) if requiere_bancarizacion else '20',
+                'formaPago': self._get_forma_pago_cobro(move) if requiere_bancarizacion else '',
+                'codEstab': self._get_cod_estab_move(move),
 
                 # Metadatos para vista y XLSX
                 '_move_id': move.id,
@@ -349,6 +354,32 @@ class EcAtsReport(models.AbstractModel):
             result.append(registro)
 
         return result
+
+    def _get_ventas_establecimiento(self, ventas):
+        """
+        Consolida ventas por establecimiento para el bloque ventasEstablecimiento.
+        Regla: usa l10n_ec_entity del diario cuando existe; fallback al número del documento.
+        """
+        totales_estab = defaultdict(float)
+        for venta in ventas:
+            cod_estab = str(venta.get('codEstab') or '').zfill(3)
+            if not cod_estab.isdigit():
+                cod_estab = '001'
+            monto = (
+                float(venta.get('baseNoGraIva', 0.0) or 0.0)
+                + float(venta.get('baseImponible', 0.0) or 0.0)
+                + float(venta.get('baseImpGrav', 0.0) or 0.0)
+            )
+            totales_estab[cod_estab] += monto
+
+        return [
+            {
+                'codEstab': estab,
+                'ventasEstab': total,
+                'ivaComp': 0.0,
+            }
+            for estab, total in sorted(totales_estab.items())
+        ]
 
     # ─────────────────────────────────────────────────────────────
     # MÓDULO EXPORTACIONES
@@ -376,14 +407,19 @@ class EcAtsReport(models.AbstractModel):
         result = []
         for move in moves:
             result.append({
-                'tpIdCliente': self._get_tipo_id(move.partner_id),
-                'idCliente': move.partner_id.vat or '',
+                'tpIdClienteEx': '20',
+                'idClienteEx': move.partner_id.vat or '',
+                'parteRelExp': 'SI' if self._es_parte_relacionada(move.partner_id) else 'NO',
+                'exportacionDe': '01',
                 'tipoComprobante': '10',
-                'numeroComprobantes': 1,
-                'baseNoGraIva': 0.0,
-                'baseImponible': 0.0,
-                'baseImpGrav': abs(move.amount_untaxed),
-                'montoIva': 0.0,
+                'fechaEmbarque': self._format_date(move.invoice_date),
+                'valorFOB': abs(move.amount_untaxed),
+                'valorFOBComprobante': abs(move.amount_untaxed),
+                'establecimiento': self._get_establecimiento(move.name),
+                'puntoEmision': self._get_punto_emision(move.name),
+                'secuencial': self._get_secuencial(move.name),
+                'autorizacion': self._sanitize_authorization(self._get_autorizacion(move)),
+                'fechaEmision': self._format_date(move.invoice_date),
                 '_move_id': move.id,
                 '_cliente_nombre': move.partner_id.name,
                 '_numero': move.name,
@@ -427,7 +463,7 @@ class EcAtsReport(models.AbstractModel):
     # ─────────────────────────────────────────────────────────────
 
     def _build_xml(self, company, date_from, date_to, options,
-                   compras, ventas, exportaciones, anulados, totales):
+                   compras, ventas, ventas_establecimiento, exportaciones, anulados, totales):
         """
         Construye el XML del ATS conforme al esquema at.xsd del SRI.
 
@@ -442,13 +478,13 @@ class EcAtsReport(models.AbstractModel):
         root = ET.Element('iva')
 
         # ── CABECERA ──
-        ET.SubElement(root, 'TipoIDInformante').text = '04'  # Siempre RUC para sociedades
-        ET.SubElement(root, 'IdInformante').text = company.vat or ''
-        ET.SubElement(root, 'razonSocial').text = (company.name or '')[:300]
+        ET.SubElement(root, 'TipoIDInformante').text = 'R'
+        ET.SubElement(root, 'IdInformante').text = self._sanitize_ruc(company.vat)
+        ET.SubElement(root, 'razonSocial').text = self._sanitize_razon_social(company.name)
         ET.SubElement(root, 'Anio').text = anio
         ET.SubElement(root, 'Mes').text = mes
         ET.SubElement(root, 'numEstabRuc').text = self._get_num_estab(company)
-        ET.SubElement(root, 'totalVentas').text = self._fmt(totales.get('total_ventas_base', 0.0))
+        ET.SubElement(root, 'totalVentas').text = self._fmt_total(totales.get('total_ventas_base', 0.0))
         ET.SubElement(root, 'codigoOperativo').text = 'IVA'
 
         if es_semestral:
@@ -465,6 +501,12 @@ class EcAtsReport(models.AbstractModel):
             nodo_ventas = ET.SubElement(root, 'ventas')
             for v in ventas:
                 self._build_detalle_venta(nodo_ventas, v)
+
+        # ── MÓDULO VENTAS POR ESTABLECIMIENTO ──
+        if ventas_establecimiento:
+            nodo_ventas_estab = ET.SubElement(root, 'ventasEstablecimiento')
+            for v_est in ventas_establecimiento:
+                self._build_venta_establecimiento(nodo_ventas_estab, v_est)
 
         # ── MÓDULO EXPORTACIONES ──
         if exportaciones:
@@ -488,7 +530,7 @@ class EcAtsReport(models.AbstractModel):
 
         ET.SubElement(dc, 'codSustento').text = c.get('codSustento', '01')
         ET.SubElement(dc, 'tpIdProv').text = c.get('tpIdProv', '04')
-        ET.SubElement(dc, 'idProv').text = c.get('idProv', '')
+        ET.SubElement(dc, 'idProv').text = self._sanitize_identifier(c.get('idProv', ''), fallback='000')
         ET.SubElement(dc, 'tipoComprobante').text = c.get('tipoComprobante', '01')
         ET.SubElement(dc, 'parteRel').text = c.get('parteRel', 'NO')
         ET.SubElement(dc, 'fechaRegistro').text = c.get('fechaRegistro', '')
@@ -496,7 +538,7 @@ class EcAtsReport(models.AbstractModel):
         ET.SubElement(dc, 'puntoEmision').text = c.get('puntoEmision', '001')
         ET.SubElement(dc, 'secuencial').text = c.get('secuencial', '000000001')
         ET.SubElement(dc, 'fechaEmision').text = c.get('fechaEmision', '')
-        ET.SubElement(dc, 'autorizacion').text = c.get('autorizacion', '')
+        ET.SubElement(dc, 'autorizacion').text = self._sanitize_authorization(c.get('autorizacion', ''))
         ET.SubElement(dc, 'baseNoGraIva').text = self._fmt(c.get('baseNoGraIva', 0.0))
         ET.SubElement(dc, 'baseImponible').text = self._fmt(c.get('baseImponible', 0.0))
         ET.SubElement(dc, 'baseImpGrav').text = self._fmt(c.get('baseImpGrav', 0.0))
@@ -506,35 +548,42 @@ class EcAtsReport(models.AbstractModel):
         ET.SubElement(dc, 'valRetBien10').text = self._fmt(c.get('valRetBien10', 0.0))
         ET.SubElement(dc, 'valRetServ20').text = self._fmt(c.get('valRetServ20', 0.0))
         ET.SubElement(dc, 'valorRetBienes').text = self._fmt(c.get('valorRetBienes', 0.0))
+        ET.SubElement(dc, 'valRetServ50').text = self._fmt(c.get('valRetServ50', 0.0))
         ET.SubElement(dc, 'valorRetServicios').text = self._fmt(c.get('valorRetServicios', 0.0))
-        ET.SubElement(dc, 'valorRetServSinCostoBenef').text = self._fmt(c.get('valorRetServSinCostoBenef', 0.0))
+        ET.SubElement(dc, 'valRetServ100').text = self._fmt(c.get('valRetServ100', 0.0))
 
         # Retenciones IR — puede haber múltiples conceptos por factura
-        for air in c.get('detalleAir', []):
-            nodo_air = ET.SubElement(dc, 'detalleAir')
-            ET.SubElement(nodo_air, 'codigo').text = str(air.get('codigo', ''))
-            ET.SubElement(nodo_air, 'codigoRetencion').text = str(air.get('codigoRetencion', ''))
-            ET.SubElement(nodo_air, 'baseImponible').text = self._fmt(air.get('baseImponible', 0.0))
-            ET.SubElement(nodo_air, 'porcentajeRetener').text = self._fmt(air.get('porcentajeRetener', 0.0))
-            ET.SubElement(nodo_air, 'valorRetenido').text = self._fmt(air.get('valorRetenido', 0.0))
+        detalle_air = c.get('detalleAir', [])
+        if detalle_air:
+            nodo_air_parent = ET.SubElement(dc, 'air')
+            for air in detalle_air:
+                nodo_air = ET.SubElement(nodo_air_parent, 'detalleAir')
+                ET.SubElement(nodo_air, 'codRetAir').text = str(
+                    air.get('codigoRetencion') or air.get('codigo') or ''
+                )
+                ET.SubElement(nodo_air, 'baseImpAir').text = self._fmt(air.get('baseImponible', 0.0))
+                ET.SubElement(nodo_air, 'porcentajeAir').text = self._fmt(air.get('porcentajeRetener', 0.0))
+                ET.SubElement(nodo_air, 'valRetAir').text = self._fmt(air.get('valorRetenido', 0.0))
 
         # Datos del comprobante de retención (si se emitió)
         if c.get('estabRetencion1'):
             ET.SubElement(dc, 'estabRetencion1').text = c.get('estabRetencion1', '')
             ET.SubElement(dc, 'ptoEmiRetencion1').text = c.get('ptoEmiRetencion1', '')
             ET.SubElement(dc, 'secRetencion1').text = c.get('secRetencion1', '')
-            ET.SubElement(dc, 'autRetencion1').text = c.get('autRetencion1', '')
+            ET.SubElement(dc, 'autRetencion1').text = self._sanitize_authorization(c.get('autRetencion1', ''))
             ET.SubElement(dc, 'fechaEmiRet1').text = c.get('fechaEmiRet1', '')
 
         if c.get('formaPago'):
-            ET.SubElement(dc, 'formaPago').text = c.get('formaPago', '')
+            formas_pago = ET.SubElement(dc, 'formasDePago')
+            for forma in self._split_formas_pago(c.get('formaPago', '')):
+                ET.SubElement(formas_pago, 'formaPago').text = forma
 
     def _build_detalle_venta(self, parent, v):
         dv = ET.SubElement(parent, 'detalleVentas')
 
         ET.SubElement(dv, 'tpIdCliente').text = v.get('tpIdCliente', '04')
-        ET.SubElement(dv, 'idCliente').text = v.get('idCliente', '')
-        ET.SubElement(dv, 'parteRel').text = v.get('parteRel', 'NO')
+        ET.SubElement(dv, 'idCliente').text = self._sanitize_identifier(v.get('idCliente', ''), fallback='000')
+        ET.SubElement(dv, 'parteRelVtas').text = v.get('parteRel', 'NO')
         ET.SubElement(dv, 'tipoComprobante').text = v.get('tipoComprobante', '01')
         ET.SubElement(dv, 'tipoEmision').text = v.get('tipoEmision', 'F')
         ET.SubElement(dv, 'numeroComprobantes').text = str(v.get('numeroComprobantes', 1))
@@ -547,18 +596,31 @@ class EcAtsReport(models.AbstractModel):
         ET.SubElement(dv, 'valorRetRenta').text = self._fmt(v.get('valorRetRenta', 0.0))
 
         if v.get('formaPago'):
-            ET.SubElement(dv, 'formaPago').text = v.get('formaPago', '')
+            formas_pago = ET.SubElement(dv, 'formasDePago')
+            for forma in self._split_formas_pago(v.get('formaPago', '')):
+                ET.SubElement(formas_pago, 'formaPago').text = forma
 
     def _build_detalle_exportacion(self, parent, e):
         de = ET.SubElement(parent, 'detalleExportaciones')
-        ET.SubElement(de, 'tpIdClienteEx').text = e.get('tpIdCliente', '04')
-        ET.SubElement(de, 'idClienteEx').text = e.get('idCliente', '')
+        ET.SubElement(de, 'tpIdClienteEx').text = e.get('tpIdClienteEx', '20')
+        ET.SubElement(de, 'idClienteEx').text = self._sanitize_identifier(e.get('idClienteEx', ''), fallback='000')
+        ET.SubElement(de, 'parteRelExp').text = e.get('parteRelExp', 'NO')
+        ET.SubElement(de, 'exportacionDe').text = e.get('exportacionDe', '01')
         ET.SubElement(de, 'tipoComprobante').text = '10'
-        ET.SubElement(de, 'numeroComprobantes').text = str(e.get('numeroComprobantes', 1))
-        ET.SubElement(de, 'baseNoGraIva').text = self._fmt(e.get('baseNoGraIva', 0.0))
-        ET.SubElement(de, 'baseImponible').text = self._fmt(e.get('baseImponible', 0.0))
-        ET.SubElement(de, 'baseImpGrav').text = self._fmt(e.get('baseImpGrav', 0.0))
-        ET.SubElement(de, 'montoIva').text = self._fmt(e.get('montoIva', 0.0))
+        ET.SubElement(de, 'fechaEmbarque').text = e.get('fechaEmbarque', '')
+        ET.SubElement(de, 'valorFOB').text = self._fmt(e.get('valorFOB', 0.0))
+        ET.SubElement(de, 'valorFOBComprobante').text = self._fmt(e.get('valorFOBComprobante', 0.0))
+        ET.SubElement(de, 'establecimiento').text = e.get('establecimiento', '001')
+        ET.SubElement(de, 'puntoEmision').text = e.get('puntoEmision', '001')
+        ET.SubElement(de, 'secuencial').text = e.get('secuencial', '000000001')
+        ET.SubElement(de, 'autorizacion').text = self._sanitize_authorization(e.get('autorizacion', ''))
+        ET.SubElement(de, 'fechaEmision').text = e.get('fechaEmision', '')
+
+    def _build_venta_establecimiento(self, parent, venta_est):
+        ve = ET.SubElement(parent, 'ventaEst')
+        ET.SubElement(ve, 'codEstab').text = str(venta_est.get('codEstab', '001')).zfill(3)
+        ET.SubElement(ve, 'ventasEstab').text = self._fmt_total(venta_est.get('ventasEstab', 0.0))
+        ET.SubElement(ve, 'ivaComp').text = self._fmt_total(venta_est.get('ivaComp', 0.0))
 
     def _build_detalle_anulado(self, parent, a):
         da = ET.SubElement(parent, 'detalleAnulados')
@@ -567,6 +629,7 @@ class EcAtsReport(models.AbstractModel):
         ET.SubElement(da, 'puntoEmision').text = a.get('puntoEmision', '001')
         ET.SubElement(da, 'secuencialInicio').text = a.get('secuencialInicio', '000000001')
         ET.SubElement(da, 'secuencialFin').text = a.get('secuencialFin', '000000001')
+        ET.SubElement(da, 'autorizacion').text = self._sanitize_authorization(a.get('autorizacion', ''))
 
     # ─────────────────────────────────────────────────────────────
     # GENERACIÓN XLSX
@@ -749,6 +812,7 @@ class EcAtsReport(models.AbstractModel):
             'ret_iva_bienes_10': 0.0,
             'ret_iva_serv_20': 0.0,
             'ret_iva_bienes': 0.0,
+            'ret_iva_serv_50': 0.0,
             'ret_iva_serv': 0.0,
             'ret_iva_sinCosto': 0.0,
             'detalleAir': [],
@@ -790,9 +854,25 @@ class EcAtsReport(models.AbstractModel):
 
                     if 'IVA' in tax_name:
                         pct = abs(tax.amount)
-                        if pct <= 20:
+                        if pct == 10:
+                            result['ret_iva_bienes_10'] += val
+                        elif pct == 20:
+                            result['ret_iva_serv_20'] += val
+                        elif pct == 30:
                             result['ret_iva_bienes'] += val
-                        elif pct <= 70:
+                        elif pct == 50:
+                            result['ret_iva_serv_50'] += val
+                        elif pct == 70:
+                            result['ret_iva_serv'] += val
+                        elif pct == 100:
+                            result['ret_iva_sinCosto'] += val
+                        elif pct < 30:
+                            result['ret_iva_serv_20'] += val
+                        elif pct < 50:
+                            result['ret_iva_bienes'] += val
+                        elif pct < 70:
+                            result['ret_iva_serv_50'] += val
+                        elif pct < 100:
                             result['ret_iva_serv'] += val
                         else:
                             result['ret_iva_sinCosto'] += val
@@ -930,6 +1010,19 @@ class EcAtsReport(models.AbstractModel):
         """Obtiene la forma de cobro de una factura de venta."""
         return self._get_forma_pago(move)
 
+    def _get_cod_estab_move(self, move):
+        """
+        Obtiene código de establecimiento para ATS:
+        - Preferente: l10n_ec_entity del diario si usa documentos latam.
+        - Fallback: establecimiento del número del documento.
+        """
+        journal = move.journal_id
+        if journal and getattr(journal, 'l10n_latam_use_documents', False):
+            entity = str(getattr(journal, 'l10n_ec_entity', '') or '').strip()
+            if entity.isdigit():
+                return entity.zfill(3)
+        return self._get_establecimiento(move.ref or move.name)
+
     def _es_parte_relacionada(self, partner):
         """Detecta si el partner es parte relacionada."""
         return getattr(partner, 'l10n_ec_related_party', False)
@@ -974,7 +1067,7 @@ class EcAtsReport(models.AbstractModel):
 
     def _get_num_estab(self, company):
         """Número de establecimientos del RUC (dígitos 10-13 del RUC)."""
-        ruc = company.vat or ''
+        ruc = self._sanitize_ruc(company.vat)
         if len(ruc) == 13:
             return ruc[10:13]
         return '001'
@@ -996,10 +1089,66 @@ class EcAtsReport(models.AbstractModel):
         }
 
     @staticmethod
+    def _sanitize_digits(value):
+        return re.sub(r'\D', '', str(value or ''))
+
+    def _sanitize_identifier(self, value, fallback='000'):
+        cleaned = re.sub(r'[^A-Za-z0-9]', '', str(value or '')).strip()
+        if not cleaned:
+            return fallback
+        return cleaned[:13]
+
+    def _sanitize_authorization(self, value):
+        digits = self._sanitize_digits(value)
+        if len(digits) < 3:
+            return '000'
+        return digits[:49]
+
+    def _sanitize_ruc(self, value):
+        digits = self._sanitize_digits(value)
+        if len(digits) >= 13:
+            digits = digits[:13]
+        if len(digits) == 10:
+            digits = f'{digits}001'
+        if len(digits) != 13:
+            return '9999999999001'
+        return f'{digits[:10]}001'
+
+    @staticmethod
+    def _sanitize_razon_social(value):
+        cleaned = re.sub(r'[^A-Za-z0-9 ]', ' ', str(value or '').strip())
+        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+        if len(cleaned) < 5:
+            cleaned = (cleaned + ' XXXXX')[:5]
+        return cleaned[:500]
+
+    @staticmethod
+    def _split_formas_pago(value):
+        if not value:
+            return []
+        raw = str(value).replace(';', ',')
+        formas = []
+        for token in raw.split(','):
+            code = re.sub(r'\D', '', token).zfill(2)
+            if len(code) == 2 and code not in formas:
+                formas.append(code)
+        return formas or ['20']
+
+    @staticmethod
     def _fmt(value):
         """Formatea un número al formato requerido por el ATS (12.2)."""
         try:
             return f'{abs(float(value)):.2f}'
+        except (TypeError, ValueError):
+            return '0.00'
+
+    @staticmethod
+    def _fmt_total(value):
+        """
+        Formatea totales (totalVentas/ventasEstab/ivaComp), permitiendo signo.
+        """
+        try:
+            return f'{float(value):.2f}'
         except (TypeError, ValueError):
             return '0.00'
 
